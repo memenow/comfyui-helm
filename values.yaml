@@ -1,0 +1,115 @@
+# Number of pod replicas.
+replicaCount: 1
+
+# Container image settings.
+image:
+  repository: comfyui-helm # Placeholder, user will build and tag locally.
+  pullPolicy: IfNotPresent # Pull policy for the image.
+  tag: "{{ .Chart.AppVersion }}" # Image tag. Defaults to the chart's appVersion.
+
+# Image pull secrets (if using a private registry).
+imagePullSecrets: []
+# Overrides the chart name.
+nameOverride: ""
+# Overrides the full chart name.
+fullnameOverride: ""
+
+# Service account configuration.
+serviceAccount:
+  # Specifies whether a service account should be created.
+  create: true
+  # Automatically mount a ServiceAccount's API credentials.
+  automount: true
+  # Annotations to add to the service account.
+  annotations: {}
+  # The name of the service account to use.
+  # If not set and create is true, a name is generated using the fullname template.
+  name: "{{ .Release.Name }}-sa"
+
+# Pod annotations.
+podAnnotations:
+  # This annotation is required for NVIDIA GPUs to be detected correctly.
+  nvidia.com/gpu.capabilities: "compute,utility,graphics"
+# Pod labels.
+podLabels: {}
+
+# Kubernetes service configuration.
+service:
+  type: ClusterIP  # Service type (ClusterIP, NodePort, LoadBalancer).
+  port: 8188      # Service port.
+  nodePort: ""    # Optional: Specify a NodePort (only used if type is NodePort).
+
+# Ingress configuration (for external access).
+ingress:
+  enabled: false  # Enable or disable Ingress.
+  className: ""   # Ingress class name (if required by your Ingress controller).
+  annotations: {}  # Annotations for the Ingress resource.
+    # Example:
+    # kubernetes.io/ingress.class: nginx
+    # kubernetes.io/tls-acme: "true"
+  hosts:          # Hostname configuration.
+    - host: chart-example.local  # Replace with your desired hostname.
+      paths:
+        - path: /                # Path to expose.
+          pathType: ImplementationSpecific # Path type (ImplementationSpecific, Prefix, Exact).
+  tls: []  # TLS configuration (if using HTTPS).
+  # Example:
+  #  - secretName: chart-example-tls
+  #    hosts:
+  #      - chart-example.local
+
+# Resource requests and limits.
+resources:
+  limits:
+    nvidia.com/gpu: 1 # Limit to 1 NVIDIA GPU.
+  requests:
+    cpu: "4" # Request 4 CPU cores.
+    memory: "16Gi" # Request 16GB of RAM.
+    nvidia.com/gpu: 1 # Request 1 NVIDIA GPU.
+
+# Liveness and readiness probes.
+livenessProbe:
+  tcpSocket: # Use a TCP socket check for liveness.
+    port: 8188
+readinessProbe:
+  tcpSocket: # Use a TCP socket check for readiness.
+    port: 8188
+
+# Horizontal Pod Autoscaler (HPA) configuration.
+autoscaling:
+  enabled: true # Enable or disable HPA.
+  minReplicas: 1 # Minimum number of replicas.
+  maxReplicas: 100 # Maximum number of replicas.
+  targetCPUUtilizationPercentage: 80 # Target CPU utilization percentage.
+  # targetMemoryUtilizationPercentage: 80 # Target memory utilization percentage.
+
+# Additional volumes.
+volumes: []
+# - name: foo
+#   secret:
+#     secretName: mysecret
+#     optional: false
+
+# Additional volume mounts.
+volumeMounts: []
+# - name: foo
+#   mountPath: "/etc/foo"
+#   readOnly: true
+
+# Environment variables for the ComfyUI container.
+environment:
+  NVIDIA_DRIVER_CAPABILITIES: compute,utility,graphics # NVIDIA driver capabilities.
+  LD_PRELOAD: /usr/lib/x86_64-linux-gnu/libjemalloc.so.2 # Preload jemalloc for memory management.
+  PYTHONPATH: "${PYTHONPATH}:/app/ComfyUI" # Add ComfyUI to the Python path.
+  TORCH_CUDA_ARCH_LIST: "7.0;7.5;8.0;8.6+PTX" # CUDA architectures for Torch.
+  NVIDIA_VISIBLE_DEVICES: all # Make all NVIDIA devices visible.
+
+# Node selector (for scheduling pods on specific nodes).
+nodeSelector:
+  nvidia.com/gpu: "true" # Requires nodes with NVIDIA GPUs.
+
+# Tolerations (for scheduling pods on nodes with taints).
+tolerations: []
+
+# Affinity (for pod scheduling preferences).
+affinity: {}
