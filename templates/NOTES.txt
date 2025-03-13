@@ -1,0 +1,30 @@
+Thank you for installing {{ .Chart.Name }}.
+
+Your ComfyUI instance is now deploying. This may take a few minutes depending on your environment.
+
+{{- if contains "NodePort" .Values.service.type }}
+Get the application URL by running these commands:
+  export NODE_PORT=$(kubectl get --namespace {{ .Release.Namespace }} -o jsonpath="{.spec.ports[0].nodePort}" services {{ include "comfyui-helm.fullname" . }})
+  export NODE_IP=$(kubectl get nodes --namespace {{ .Release.Namespace }} -o jsonpath="{.items[0].status.addresses[0].address}")
+  echo http://$NODE_IP:$NODE_PORT
+
+{{- else if contains "LoadBalancer" .Values.service.type }}
+Get the application URL by running these commands:
+   NOTE: It may take a few minutes for the LoadBalancer IP to be available.
+         You can watch the status by running 'kubectl get --namespace {{ .Release.Namespace }} svc -w {{ include "comfyui-helm.fullname" . }}'
+  export SERVICE_IP=$(kubectl get svc --namespace {{ .Release.Namespace }} {{ include "comfyui-helm.fullname" . }} --template "{{"{{ range (index .status.loadBalancer.ingress 0) }}{{.}}{{ end }}"}}")
+  echo http://$SERVICE_IP:{{ .Values.service.port }}
+
+{{- else if contains "ClusterIP" .Values.service.type }}
+Access your ComfyUI instance using kubectl port-forward:
+  kubectl port-forward --namespace {{ .Release.Namespace }} svc/{{ include "comfyui-helm.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+  Then access ComfyUI at: http://localhost:{{ .Values.service.port }}
+
+{{- end }}
+
+{{- if .Values.ingress.enabled }}
+Your ComfyUI instance can also be accessed through the ingress at:
+{{- range .Values.ingress.hosts }}
+  http{{ if $.Values.ingress.tls }}s{{ end }}://{{ .host }}
+{{- end }}
+{{- end }}

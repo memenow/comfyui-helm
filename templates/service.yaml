@@ -1,0 +1,22 @@
+{{- /*
+This template defines the Kubernetes Service for ComfyUI.
+It exposes the ComfyUI application on the specified port.
+*/ -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "comfyui-helm.fullname" . }}
+  labels:
+    {{- include "comfyui-helm.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }} # Service type (e.g., ClusterIP, NodePort, LoadBalancer).
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+      {{- if and (eq .Values.service.type "NodePort") .Values.service.nodePort }}
+      nodePort: {{ .Values.service.nodePort }}
+      {{- end }}
+  selector:
+    {{- include "comfyui-helm.selectorLabels" . | nindent 4 }}
