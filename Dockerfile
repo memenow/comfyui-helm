@@ -40,40 +40,41 @@ ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
 # - Performance optimization libraries (jemalloc, perftools)
 # - SSL/TLS and cryptographic libraries
 # - System monitoring tools
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 \
-    python3-pip \
-    python3-dev \
-    python3-venv \
-    git \
-    wget \
-    curl \
-    unzip \
-    build-essential \
-    cmake \
-    libgl1-mesa-glx \
-    libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender1 \
-    libgomp1 \
-    libgoogle-perftools4 \
-    libjemalloc2 \
-    libopencv-dev \
-    libssl-dev \
-    libffi-dev \
-    libjpeg-dev \
-    libpng-dev \
-    libwebp-dev \
-    libtiff-dev \
-    libavcodec-dev \
-    libavformat-dev \
-    libswscale-dev \
-    libavutil-dev \
-    ffmpeg \
-    nvtop \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        python3 \
+        python3-pip \
+        python3-dev \
+        python3-venv \
+        git \
+        wget \
+        curl \
+        unzip \
+        build-essential \
+        cmake \
+        libgl1-mesa-glx \
+        libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        libxrender1 \
+        libgomp1 \
+        libgoogle-perftools4 \
+        libjemalloc2 \
+        libopencv-dev \
+        libssl-dev \
+        libffi-dev \
+        libjpeg-dev \
+        libpng-dev \
+        libwebp-dev \
+        libtiff-dev \
+        libavcodec-dev \
+        libavformat-dev \
+        libswscale-dev \
+        libavutil-dev \
+        ffmpeg \
+        nvtop && \
+    rm -rf /var/lib/apt/lists/* && \
+    apt-get clean
 
 # Set the working directory for the application
 # All subsequent commands will run from this directory
