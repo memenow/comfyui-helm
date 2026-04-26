@@ -1,66 +1,57 @@
 # ComfyUI Docker Image
 # ====================
-# 
-# This Dockerfile builds a production-ready container for ComfyUI, a powerful and modular
-# Stable Diffusion GUI and backend. The image includes CUDA support for GPU acceleration,
-# comprehensive machine learning libraries, and all necessary dependencies.
 #
-# Base Image: NVIDIA CUDA 12.4.1 with cuDNN on Ubuntu 22.04
-# Target: GPU-accelerated machine learning workloads
-# Architecture: x86_64
+# Multi-stage build that produces a CUDA-accelerated container for ComfyUI,
+# a modular Stable Diffusion GUI and backend.
 #
-# Build command:
-#   docker build -t comfyui:latest .
+# Builder stage : NVIDIA CUDA 12.8.0 cuDNN -devel- on Ubuntu 22.04
+#                 Compiles native extensions (xformers, bitsandbytes, etc.)
+#                 against nvcc and full -dev headers, then installs all
+#                 Python dependencies into /usr/local/lib/python3.12.
+# Runtime stage : NVIDIA CUDA 12.8.0 cuDNN -runtime- on Ubuntu 22.04
+#                 Carries only runtime shared libraries plus Python 3.12,
+#                 and inherits the prebuilt site-packages and ComfyUI tree
+#                 from the builder. Trims roughly 3 GB versus a single-stage
+#                 -devel- image.
 #
-# Run command:
-#   docker run -d --gpus all -p 8188:8188 comfyui:latest
+# Build:
+#   docker build -t ghcr.io/memenow/comfyui-helm:v2.0.0 .
+#
+# Run:
+#   docker run -d --gpus all -p 8188:8188 ghcr.io/memenow/comfyui-helm:v2.0.0
 
-# Use NVIDIA's official CUDA runtime image with cuDNN for deep learning acceleration
-# This provides CUDA 12.4.1, cuDNN, and Ubuntu 22.04 LTS as the base system
-FROM nvcr.io/nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+# ---------------------------------------------------------------------------
+# Stage 1: builder
+# ---------------------------------------------------------------------------
+FROM nvcr.io/nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04 AS builder
 
-# Configure environment variables for optimal container behavior
-# Prevent interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
-# Ensure Python output is sent straight to terminal without buffering
 ENV PYTHONUNBUFFERED=1
-# Set CUDA installation directory
 ENV CUDA_HOME=/usr/local/cuda
-# Add CUDA binaries to system PATH
 ENV PATH=${CUDA_HOME}/bin:${PATH}
-# Add CUDA libraries to library path
 ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
+# CUDA architectures used when xformers / custom kernels compile from source.
+# Covers Volta (7.0) through Hopper (9.0) plus Blackwell (10.0 datacenter,
+# 12.0 consumer). +PTX keeps forward compatibility with newer GPUs.
+ENV TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9;9.0;10.0;12.0+PTX"
 
-# Install system dependencies and development tools
-# This comprehensive package list includes:
-# - Python 3 and development headers
-# - Build tools for compiling native extensions
-# - Media processing libraries (OpenCV, FFmpeg)
-# - Graphics and visualization libraries
-# - Performance optimization libraries (jemalloc, perftools)
-# - SSL/TLS and cryptographic libraries
-# - System monitoring tools
+# Build-time system dependencies: Python 3.12 from deadsnakes plus headers
+# and toolchain required to compile native Python wheels.
 RUN apt-get update && \
+    apt-get install -y --no-install-recommends software-properties-common ca-certificates && \
+    add-apt-repository ppa:deadsnakes/ppa && \
+    apt-get update && \
     apt-get install -y --no-install-recommends \
-        python3 \
-        python3-pip \
-        python3-dev \
-        python3-venv \
+        python3.12 \
+        python3.12-venv \
+        python3.12-dev \
         git \
         wget \
         curl \
         unzip \
         build-essential \
         cmake \
-        libgl1-mesa-glx \
-        libglib2.0-0 \
-        libsm6 \
-        libxext6 \
-        libxrender1 \
-        libgomp1 \
-        libgoogle-perftools4 \
-        libjemalloc2 \
-        libopencv-dev \
+        pkg-config \
         libssl-dev \
         libffi-dev \
         libjpeg-dev \
@@ -71,129 +62,186 @@ RUN apt-get update && \
         libavformat-dev \
         libswscale-dev \
         libavutil-dev \
-        ffmpeg \
-        nvtop && \
+        libopencv-dev && \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 && \
     rm -rf /var/lib/apt/lists/* && \
     apt-get clean
 
-# Set the working directory for the application
-# All subsequent commands will run from this directory
 WORKDIR /app
 
-# Upgrade Python package management tools to latest versions
-# This ensures compatibility with modern Python packages and security updates
-RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel
+# Bootstrap pip for Python 3.12 (deadsnakes does not ship pip).
+RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3 && \
+    python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel
 
-# Install PyTorch with CUDA 12.1 support
-# PyTorch is the core deep learning framework used by ComfyUI
-# The specific versions are chosen for stability and CUDA compatibility
-RUN pip3 install --no-cache-dir \
-    torch==2.5.0 \
-    torchvision==0.20.0 \
-    torchaudio==2.5.0 \
-    --extra-index-url https://download.pytorch.org/whl/cu121
+# Install PyTorch with CUDA 12.8 wheels.
+RUN python3 -m pip install --no-cache-dir \
+        --extra-index-url https://download.pytorch.org/whl/cu128 \
+        torch==2.9.1 \
+        torchvision==0.24.1 \
+        torchaudio==2.9.1
 
-# Clone the ComfyUI repository from GitHub
-# This gets the latest stable version of the ComfyUI application
-RUN git clone https://github.com/comfyanonymous/ComfyUI.git
+# Lock PyTorch versions globally so transitive dependencies cannot upgrade them.
+RUN printf 'torch==2.9.1\ntorchvision==0.24.1\ntorchaudio==2.9.1\n' > /etc/pip-constraints.txt
+ENV PIP_CONSTRAINT=/etc/pip-constraints.txt
 
-# Change to the ComfyUI directory for subsequent operations
+# Pin ComfyUI core to a specific commit for reproducible builds.
+# Override with --build-arg COMFYUI_REF=<sha|tag|branch> when rebuilding.
+ARG COMFYUI_REF=df22bcd5e192ce0b1ae09eaf2e423d0a12cf6638
+RUN git clone https://github.com/Comfy-Org/ComfyUI.git && \
+    cd /app/ComfyUI && \
+    git checkout "${COMFYUI_REF}"
+
 WORKDIR /app/ComfyUI
 
-# Install ComfyUI's core dependencies from requirements.txt
-# This includes the essential packages needed for basic functionality
-RUN pip3 install --no-cache-dir -r requirements.txt
+# ComfyUI's own Python requirements.
+RUN python3 -m pip install --no-cache-dir -r requirements.txt
 
-# Install core computer vision and image processing libraries
-# These packages provide essential functionality for image manipulation,
-# computer vision tasks, and deep learning model inference
-RUN pip3 install --no-cache-dir \
-    opencv-python-headless \
-    opencv-contrib-python-headless \
-    scikit-image \
-    imageio \
-    imageio-ffmpeg \
-    diffusers \
-    transformers \
-    accelerate \
-    xformers \
-    insightface \
-    onnxruntime-gpu \
-    librosa \
-    soundfile \
-    numpy \
-    scipy \
-    pandas \
-    scikit-learn \
-    requests \
-    aiohttp \
-    fastapi \
-    uvicorn \
-    pillow-simd \
-    tqdm \
-    psutil \
-    GPUtil \
-    matplotlib \
-    seaborn \
-    controlnet-aux \
-    bitsandbytes \
-    pympler
+# Install curated custom nodes during image build so the container does not
+# need to clone repositories or install Python packages at startup.
+# Each reference may be a branch, tag, or commit SHA for reproducible pinning.
+ARG COMFYUI_MANAGER_REF=491f847bbc286588175695ea43fa4e13cd14a437
+ARG COMFYUI_GGUF_REF=6ea2651e7df66d7585f6ffee804b20e92fb38b8a
+ARG COMFYUI_KJNODES_REF=b7646ad70a7daa7aeb919ca542274758d26ba2df
+ARG COMFYUI_LTXVIDEO_REF=2acf7af8991f33b5cc06ec26753cb6e88e057d04
+ARG COMFYUI_SEEDVR2_REF=4490bd1f482e026674543386bb2a4d176da245b9
+ARG COMFYUI_VIDEOHELPERSUITE_REF=2984ec4c4b93292421888f38db74a5e8802a8ff8
+ARG COMFYUI_WANVIDEOWRAPPER_REF=df8f3e49daaad117cf3090cc916c83f3d001494c
+ARG COMFYUI_NVIDIA_RTX_REF=892515e3eb9a4920a131a502a047e47adca9eb0d
+RUN set -eux; \
+    mkdir -p /app/ComfyUI/custom_nodes; \
+    git clone https://github.com/Comfy-Org/ComfyUI-Manager.git /app/ComfyUI/custom_nodes/ComfyUI-Manager; \
+    git -C /app/ComfyUI/custom_nodes/ComfyUI-Manager checkout "${COMFYUI_MANAGER_REF}"; \
+    git clone https://github.com/city96/ComfyUI-GGUF.git /app/ComfyUI/custom_nodes/ComfyUI-GGUF; \
+    git -C /app/ComfyUI/custom_nodes/ComfyUI-GGUF checkout "${COMFYUI_GGUF_REF}"; \
+    git clone https://github.com/kijai/ComfyUI-KJNodes.git /app/ComfyUI/custom_nodes/ComfyUI-KJNodes; \
+    git -C /app/ComfyUI/custom_nodes/ComfyUI-KJNodes checkout "${COMFYUI_KJNODES_REF}"; \
+    git clone https://github.com/Lightricks/ComfyUI-LTXVideo.git /app/ComfyUI/custom_nodes/ComfyUI-LTXVideo; \
+    git -C /app/ComfyUI/custom_nodes/ComfyUI-LTXVideo checkout "${COMFYUI_LTXVIDEO_REF}"; \
+    git clone https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git /app/ComfyUI/custom_nodes/ComfyUI-SeedVR2_VideoUpscaler; \
+    git -C /app/ComfyUI/custom_nodes/ComfyUI-SeedVR2_VideoUpscaler checkout "${COMFYUI_SEEDVR2_REF}"; \
+    git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git /app/ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite; \
+    git -C /app/ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite checkout "${COMFYUI_VIDEOHELPERSUITE_REF}"; \
+    git clone https://github.com/kijai/ComfyUI-WanVideoWrapper.git /app/ComfyUI/custom_nodes/ComfyUI-WanVideoWrapper; \
+    git -C /app/ComfyUI/custom_nodes/ComfyUI-WanVideoWrapper checkout "${COMFYUI_WANVIDEOWRAPPER_REF}"; \
+    git clone https://github.com/Comfy-Org/Nvidia_RTX_Nodes_ComfyUI.git /app/ComfyUI/custom_nodes/Nvidia_RTX_Nodes_ComfyUI; \
+    git -C /app/ComfyUI/custom_nodes/Nvidia_RTX_Nodes_ComfyUI checkout "${COMFYUI_NVIDIA_RTX_REF}"; \
+    for requirements in /app/ComfyUI/custom_nodes/*/requirements.txt; do \
+        python3 -m pip install --no-cache-dir -r "${requirements}"; \
+    done
 
-# Install additional specialized AI and computer vision packages
-# These provide advanced functionality for specific use cases:
-# - segment-anything: Meta's SAM for object segmentation
-# - mediapipe: Google's ML framework for perception tasks
-# - rembg & backgroundremover: Background removal tools
-# - ultralytics: YOLO object detection framework
-# - trimesh: 3D mesh processing
-# - moviepy: Video editing and processing
-# - kornia: Computer vision library for PyTorch
-# - albumentations: Advanced image augmentation
-# - huggingface-hub: Access to Hugging Face model repository
-# - rich, typer, click: Enhanced CLI and terminal output
-RUN pip3 install --no-cache-dir \
-    segment-anything \
-    mediapipe \
-    rembg \
-    backgroundremover \
-    ultralytics \
-    trimesh \
-    moviepy \
-    kornia \
-    albumentations \
-    huggingface-hub \
-    rich \
-    typer \
-    click
-# Set appropriate file permissions for the ComfyUI application directory
-# This ensures the application can read its files and execute properly
-RUN chmod -R 755 /app/ComfyUI
+# Additional CV / ML / utility packages. Anything already pulled by ComfyUI
+# requirements.txt (transformers, numpy, scipy, tqdm, psutil, aiohttp,
+# kornia, Pillow, requests) is intentionally omitted.
+RUN python3 -m pip install --no-cache-dir \
+        --extra-index-url https://download.pytorch.org/whl/cu128 \
+        opencv-python-headless \
+        opencv-contrib-python-headless \
+        scikit-image \
+        imageio \
+        imageio-ffmpeg \
+        diffusers \
+        accelerate \
+        xformers \
+        insightface \
+        onnxruntime-gpu \
+        librosa \
+        soundfile \
+        pandas \
+        scikit-learn \
+        fastapi \
+        uvicorn \
+        GPUtil \
+        matplotlib \
+        seaborn \
+        controlnet-aux \
+        bitsandbytes \
+        pympler
 
-# Configure runtime environment variables for optimal performance
-# LD_PRELOAD: Use jemalloc for better memory allocation performance
+# Specialized AI / vision packages with explicit version pins. moviepy is held
+# at 1.0.3 because most ComfyUI video custom nodes still rely on the 1.x API.
+RUN rm -rf /usr/lib/python3/dist-packages/blinker* && \
+    python3 -m pip install --no-cache-dir \
+        segment-anything \
+        mediapipe==0.10.33 \
+        rembg==2.0.75 \
+        backgroundremover==0.3.6 \
+        ultralytics==8.4.41 \
+        trimesh \
+        moviepy==1.0.3 \
+        albumentations==2.0.8 \
+        huggingface-hub \
+        rich \
+        typer \
+        click
+
+# ---------------------------------------------------------------------------
+# Stage 2: runtime
+# ---------------------------------------------------------------------------
+FROM nvcr.io/nvidia/cuda:12.8.0-cudnn-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH=${CUDA_HOME}/bin:${PATH}
+ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
+ENV PYTHONPATH=/app/ComfyUI
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
+ENV TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9;9.0;10.0;12.0+PTX"
+# Use jemalloc for better memory allocator behavior under heavy ML workloads.
 ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2
-# Disable CUDA launch blocking for better asynchronous GPU operations
 ENV CUDA_LAUNCH_BLOCKING=0
-# Enable cuDNN benchmarking for optimal performance with consistent input sizes
 ENV TORCH_BACKENDS_CUDNN_BENCHMARK=1
+# Honor the same constraint file copied from the builder so any debugging
+# pip install inside the container cannot bump torch.
+ENV PIP_CONSTRAINT=/etc/pip-constraints.txt
 
-# Expose port 8188 for ComfyUI web interface
-# This is the default port that ComfyUI uses for its web-based GUI
+# Runtime-only system dependencies. -dev packages and toolchain are not
+# carried over; opencv-python-headless ships its own bundled libraries.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends software-properties-common ca-certificates && \
+    add-apt-repository ppa:deadsnakes/ppa && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        python3.12 \
+        curl \
+        libgl1 \
+        libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        libxrender1 \
+        libgomp1 \
+        libgoogle-perftools4 \
+        libjemalloc2 \
+        ffmpeg && \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 && \
+    rm -rf /var/lib/apt/lists/* && \
+    apt-get clean
+
+# Bring in the prebuilt Python environment, console scripts, constraint file,
+# and the ComfyUI application tree from the builder stage.
+COPY --from=builder /usr/local/lib/python3.12 /usr/local/lib/python3.12
+COPY --from=builder /usr/local/bin /usr/local/bin
+COPY --from=builder /etc/pip-constraints.txt /etc/pip-constraints.txt
+COPY --from=builder /app /app
+
+# Non-root runtime user (UID/GID 10001 mirrors values.yaml runAsUser/runAsGroup).
+RUN groupadd --system --gid 10001 comfyui && \
+    useradd --system --uid 10001 --gid comfyui --shell /usr/sbin/nologin \
+        --create-home --home-dir /home/comfyui comfyui && \
+    chown -R comfyui:comfyui /app /home/comfyui
+
+WORKDIR /app/ComfyUI
+USER 10001:10001
+
 EXPOSE 8188
 
-# Configure health check to monitor container status
-# This checks if the ComfyUI web interface is responding properly
-# - Check interval: every 30 seconds
-# - Timeout: 10 seconds per check
-# - Start period: 60 seconds (allows time for startup)
-# - Retries: 3 failed checks before marking as unhealthy
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:8188/ || exit 1
+# Liveness check hits /system_stats which returns immediately once the HTTP
+# server is up, well before models finish loading.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+    CMD curl -fsS http://localhost:8188/system_stats || exit 1
 
-# Start ComfyUI with production-ready configuration
-# - Listen on all interfaces (0.0.0.0) for container accessibility
-# - Use port 8188 (standard ComfyUI port)
-# - Enable CUDA memory allocation optimizations
+# Start ComfyUI bound to all interfaces on the canonical port with the
+# CUDA caching allocator enabled.
 CMD ["python3", "main.py", \
     "--listen", "0.0.0.0", \
     "--port", "8188", \

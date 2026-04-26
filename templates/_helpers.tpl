@@ -60,3 +60,26 @@ Create the name of the service account to use
 {{- default "default" .Values.serviceAccount.name }}
 {{- end }}
 {{- end }}
+
+{{/*
+Returns "true" when at least one persistence entry is enabled, otherwise "".
+Use as: {{- if include "comfyui-helm.persistenceEnabled" . }} ... {{- end }}
+*/}}
+{{- define "comfyui-helm.persistenceEnabled" -}}
+{{- range $name, $cfg := .Values.persistence -}}
+{{- if $cfg.enabled -}}true{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Resolve the claim name for a persistence entry: existingClaim wins, otherwise
+generate <fullname>-<key>.
+Args: dict "root" $ "name" "models" "cfg" $cfg
+*/}}
+{{- define "comfyui-helm.persistenceClaimName" -}}
+{{- if .cfg.existingClaim -}}
+{{- .cfg.existingClaim -}}
+{{- else -}}
+{{- printf "%s-%s" (include "comfyui-helm.fullname" .root) .name -}}
+{{- end -}}
+{{- end -}}

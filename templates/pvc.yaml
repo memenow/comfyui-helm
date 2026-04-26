@@ -1,0 +1,26 @@
+{{- /*
+Render one PersistentVolumeClaim per enabled persistence entry. Entries that
+reference an existingClaim are skipped because the claim is provisioned
+externally.
+*/ -}}
+{{- range $name, $cfg := .Values.persistence }}
+{{- if and $cfg.enabled (not $cfg.existingClaim) }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ printf "%s-%s" (include "comfyui-helm.fullname" $) $name }}
+  labels:
+    {{- include "comfyui-helm.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}
+spec:
+  accessModes:
+    {{- toYaml $cfg.accessModes | nindent 4 }}
+  resources:
+    requests:
+      storage: {{ $cfg.size | quote }}
+  {{- with $cfg.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+{{- end }}
+{{- end }}
