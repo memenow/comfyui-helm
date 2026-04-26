@@ -3,9 +3,9 @@ replicaCount: 1
 
 # Container image settings.
 image:
-  repository: comfyui-helm # Placeholder, user will build and tag locally.
+  repository: ghcr.io/memenow/comfyui-helm # Use the GHCR image name for local builds as well.
   pullPolicy: IfNotPresent # Pull policy for the image.
-  tag: "{{ .Chart.AppVersion }}" # Image tag. Defaults to the chart's appVersion.
+  tag: "" # Image tag. Defaults to the chart's appVersion, which should match the GHCR tag.
 
 # Image pull secrets (if using a private registry).
 imagePullSecrets: []
@@ -19,19 +19,47 @@ serviceAccount:
   # Specifies whether a service account should be created.
   create: true
   # Automatically mount a ServiceAccount's API credentials.
-  automount: true
+  # ComfyUI does not call the Kubernetes API, so the token is omitted by default.
+  automount: false
   # Annotations to add to the service account.
   annotations: {}
   # The name of the service account to use.
   # If not set and create is true, a name is generated using the fullname template.
-  name: "{{ .Release.Name }}-sa"
+  name: ""
 
 # Pod annotations.
-podAnnotations:
-  # This annotation is required for NVIDIA GPUs to be detected correctly.
-  nvidia.com/gpu.capabilities: "compute,utility,graphics"
+podAnnotations: {}
 # Pod labels.
 podLabels: {}
+
+# Disable the projected ServiceAccount token at the pod level as well; ComfyUI
+# does not need Kubernetes API access. Override only if a sidecar requires it.
+automountServiceAccountToken: false
+
+# Pod-level security context. Defaults satisfy the Pod Security Standards
+# baseline profile and rely on the comfyui (uid 10001) user baked into the
+# image. fsGroup is applied to mounted volumes so the unprivileged user can
+# write into PersistentVolumeClaims.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+# Container-level security context. readOnlyRootFilesystem is left disabled
+# because ComfyUI writes to /app/ComfyUI/{output,temp,input,user}; flip it on
+# once those directories are mounted from PersistentVolumeClaims (see
+# persistence.* below).
+securityContext:
+  allowPrivilegeEscalation: false
+  privileged: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop:
+      - ALL
 
 # Kubernetes service configuration.
 service:
@@ -59,54 +87,164 @@ ingress:
   #      - chart-example.local
 
 # Resource requests and limits.
+# Extended resources (nvidia.com/gpu) are only specified under limits; Kubernetes
+# automatically mirrors them into requests, and listing them in both is redundant.
 resources:
   limits:
     nvidia.com/gpu: 1 # Limit to 1 NVIDIA GPU.
   requests:
-    cpu: "4" # Request 4 CPU cores.
+    cpu: "2" # Request 2 CPU cores (inference is GPU-bound).
     memory: "16Gi" # Request 16GB of RAM.
-    nvidia.com/gpu: 1 # Request 1 NVIDIA GPU.
 
-# Liveness and readiness probes.
+# Probes.
+# ComfyUI binds the listener before models finish loading, so a tcpSocket probe
+# would falsely succeed and a liveness probe would restart the pod during the
+# 30-120s warmup. Use HTTP probes against /system_stats and a startupProbe that
+# absorbs the cold start.
+startupProbe:
+  httpGet:
+    path: /system_stats
+    port: http
+  failureThreshold: 30 # ~5 minute budget (30 * 10s) for model preload
+  periodSeconds: 10
+  timeoutSeconds: 5
 livenessProbe:
-  tcpSocket: # Use a TCP socket check for liveness.
-    port: 8188
+  httpGet:
+    path: /system_stats
+    port: http
+  periodSeconds: 30
+  timeoutSeconds: 5
+  failureThreshold: 3
 readinessProbe:
-  tcpSocket: # Use a TCP socket check for readiness.
-    port: 8188
+  httpGet:
+    path: /system_stats
+    port: http
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
 
-# Horizontal Pod Autoscaler (HPA) configuration.
+# Graceful shutdown: give in-flight generations time to finish before SIGKILL.
+# preStop sleep lets Service endpoints converge before the listener exits.
+terminationGracePeriodSeconds: 90
+lifecycle:
+  preStop:
+    exec:
+      command: ["/bin/sh", "-c", "sleep 15"]
+
+# Horizontal Pod Autoscaler (HPA).
+# Disabled by default: ComfyUI is GPU-bound, so CPU/memory utilization is the
+# wrong scaling signal and over-provisioning a fleet on CPU% will queue pods on
+# unschedulable GPU nodes. For meaningful autoscaling, prefer KEDA with the
+# DCGM exporter (DCGM_FI_DEV_GPU_UTIL) or a queue-depth metric. The Resource
+# metric below is kept for users who explicitly want it.
 autoscaling:
-  enabled: true # Enable or disable HPA.
-  minReplicas: 1 # Minimum number of replicas.
-  maxReplicas: 100 # Maximum number of replicas.
-  targetCPUUtilizationPercentage: 80 # Target CPU utilization percentage.
-  # targetMemoryUtilizationPercentage: 80 # Target memory utilization percentage.
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 80
+  # targetMemoryUtilizationPercentage: 80
 
-# Additional volumes.
+# PodDisruptionBudget (opt-in). Recommended whenever replicaCount > 1 or HPA is
+# enabled. Set either minAvailable or maxUnavailable, not both.
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+  maxUnavailable: ""
+
+# NetworkPolicy (opt-in). When enabled, ingress is restricted to the namespaces
+# listed in ingressNamespaceSelectors and egress is allowed to DNS plus the
+# CIDRs / FQDNs in egressAllowedCIDRs. Tune for your environment.
+networkPolicy:
+  enabled: false
+  ingressNamespaceSelectors:
+    - matchLabels:
+        kubernetes.io/metadata.name: ingress-nginx
+  egressAllowedCIDRs:
+    - 0.0.0.0/0
+
+# Pod-level scheduling controls.
+# priorityClassName: assign a higher-priority class for user-facing inference.
+priorityClassName: ""
+# topologySpreadConstraints: spread replicas across zones / hosts when scaling.
+topologySpreadConstraints: []
+# - maxSkew: 1
+#   topologyKey: topology.kubernetes.io/zone
+#   whenUnsatisfiable: ScheduleAnyway
+#   labelSelector:
+#     matchLabels:
+#       app.kubernetes.io/name: comfyui-helm
+
+# Persistent storage for ComfyUI runtime data. Each entry creates a
+# PersistentVolumeClaim (unless existingClaim is set) and mounts it at the
+# canonical ComfyUI path. ReadWriteMany is the default access mode because
+# the chart is intended to scale; pair it with EFS / Filestore /
+# Mountpoint-S3 / CephFS / Longhorn RWX. Set accessModes to
+# [ReadWriteOnce] if running a single replica on block storage.
+persistence:
+  models:
+    enabled: false
+    existingClaim: ""
+    storageClass: ""
+    accessModes:
+      - ReadWriteMany
+    size: 200Gi
+    mountPath: /app/ComfyUI/models
+  output:
+    enabled: false
+    existingClaim: ""
+    storageClass: ""
+    accessModes:
+      - ReadWriteMany
+    size: 50Gi
+    mountPath: /app/ComfyUI/output
+  input:
+    enabled: false
+    existingClaim: ""
+    storageClass: ""
+    accessModes:
+      - ReadWriteMany
+    size: 10Gi
+    mountPath: /app/ComfyUI/input
+  user:
+    enabled: false
+    existingClaim: ""
+    storageClass: ""
+    accessModes:
+      - ReadWriteMany
+    size: 10Gi
+    mountPath: /app/ComfyUI/user
+
+# Additional freeform volumes appended after the persistence-derived ones.
 volumes: []
 # - name: foo
 #   secret:
 #     secretName: mysecret
 #     optional: false
 
-# Additional volume mounts.
+# Additional freeform volume mounts appended after the persistence-derived ones.
 volumeMounts: []
 # - name: foo
 #   mountPath: "/etc/foo"
 #   readOnly: true
 
-# Environment variables for the ComfyUI container.
-environment:
-  NVIDIA_DRIVER_CAPABILITIES: compute,utility,graphics # NVIDIA driver capabilities.
-  LD_PRELOAD: /usr/lib/x86_64-linux-gnu/libjemalloc.so.2 # Preload jemalloc for memory management.
-  PYTHONPATH: "${PYTHONPATH}:/app/ComfyUI" # Add ComfyUI to the Python path.
-  TORCH_CUDA_ARCH_LIST: "7.0;7.5;8.0;8.6+PTX" # CUDA architectures for Torch.
-  NVIDIA_VISIBLE_DEVICES: all # Make all NVIDIA devices visible.
+# Environment variables injected into the ComfyUI container at runtime.
+# Image-baked variables (PYTHONPATH, NVIDIA_DRIVER_CAPABILITIES, LD_PRELOAD,
+# TORCH_CUDA_ARCH_LIST, CUDA_LAUNCH_BLOCKING, TORCH_BACKENDS_CUDNN_BENCHMARK)
+# live in the Dockerfile. Never set NVIDIA_VISIBLE_DEVICES here: Kubernetes does
+# not expand shell variables in env values, and overriding it defeats the per-pod
+# GPU isolation provided by the NVIDIA device plugin.
+environment: {}
 
 # Node selector (for scheduling pods on specific nodes).
-nodeSelector:
-  nvidia.com/gpu: "true" # Requires nodes with NVIDIA GPUs.
+# Empty by default: GPU pods land on whichever node has a free nvidia.com/gpu
+# (the NVIDIA device plugin advertises that extended resource). Override with
+# either of the two patterns below depending on how your cluster labels GPU
+# nodes:
+#   nodeSelector:
+#     nvidia.com/gpu: "true"                                 # manual label
+#   nodeSelector:
+#     feature.node.kubernetes.io/pci-10de.present: "true"    # NFD / GPU Operator
+nodeSelector: {}
 
 # Tolerations (for scheduling pods on nodes with taints).
 tolerations: []

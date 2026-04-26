@@ -1,0 +1,24 @@
+# Keep the build context small. Anything not needed by Dockerfile stays out.
+.git
+.gitignore
+.dockerignore
+.helmignore
+.claude
+.serena
+.idea
+.vscode
+.DS_Store
+*.swp
+*.bak
+*.tmp
+*.orig
+*~
+CLAUDE.md
+CLAUDE.local.md
+README.md
+LICENSE
+Chart.yaml
+values.yaml
+templates
+charts
+**/*.md
